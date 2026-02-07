@@ -1,5 +1,3 @@
-import { redirect } from 'next/navigation'
-
 export default function Home() {
-  redirect('/admin/numbers')
+  return <h1>HOME OK</h1>
 }
