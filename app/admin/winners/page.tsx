@@ -48,6 +48,10 @@ type AnalysisResponse = {
   error?: string
   calledNumbersCount?: number
   cardsAnalyzed?: number
+  dataIssues?: {
+    cardsWithoutCells: number
+    cardsWithIncompleteCells: number
+  }
   full?: AnalysisBuckets
   patterns?: PatternAnalysis[]
 }
@@ -614,6 +618,24 @@ export default function WinnersPage() {
             Numeros cantados: <strong>{analysis.calledNumbersCount ?? 0}</strong> | Cartones analizados:{' '}
             <strong>{analysis.cardsAnalyzed ?? 0}</strong>
           </div>
+
+          {((analysis.dataIssues?.cardsWithoutCells ?? 0) > 0 ||
+            (analysis.dataIssues?.cardsWithIncompleteCells ?? 0) > 0) && (
+            <div
+              style={{
+                borderRadius: 10,
+                padding: 9,
+                marginBottom: 8,
+                background: '#3f1d0a',
+                border: '1px solid #ea580c',
+                color: '#fed7aa',
+                fontSize: 14,
+              }}
+            >
+              Advertencia de datos: {analysis.dataIssues?.cardsWithoutCells ?? 0} cartones sin celdas y{' '}
+              {analysis.dataIssues?.cardsWithIncompleteCells ?? 0} cartones con celdas incompletas.
+            </div>
+          )}
 
           <div
             style={{

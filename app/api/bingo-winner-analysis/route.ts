@@ -47,6 +47,11 @@ type PatternAnalysisResult = {
   buckets: AnalysisBuckets
 }
 
+type DataIssues = {
+  cardsWithoutCells: number
+  cardsWithIncompleteCells: number
+}
+
 type RequestBody = {
   batchId?: string | null
   patternId?: string | null
@@ -82,6 +87,17 @@ const sortBuckets = (buckets: AnalysisBuckets) => {
   buckets.missing3.sort((a, b) => a.cardCode - b.cardCode)
   return buckets
 }
+
+const isCenterCell = (row: number, col: number) => row === 3 && col === 3
+
+const fullBoardTargets: PatternCell[] = Array.from({ length: 5 }, (_, rowIndex) =>
+  Array.from({ length: 5 }, (_, colIndex) => ({
+    row: rowIndex + 1,
+    col: colIndex + 1,
+  }))
+)
+  .flat()
+  .filter((cell) => !isCenterCell(cell.row, cell.col))
 
 const getCardsByCodes = async (codes: number[]) => {
   const supabaseAdmin = getSupabaseAdmin()
@@ -258,6 +274,10 @@ export async function POST(request: Request) {
         calledNumbersCount: calledNumbers.length,
         cardsAnalyzed: 0,
         full: emptyBuckets(),
+        dataIssues: {
+          cardsWithoutCells: 0,
+          cardsWithIncompleteCells: 0,
+        } satisfies DataIssues,
         patterns: emptyPatternResults,
         pattern: emptyPatternResults[0] ?? { selected: null, targetCells: 0, buckets: emptyBuckets() },
       })
@@ -276,6 +296,10 @@ export async function POST(request: Request) {
     }
 
     const fullBuckets = emptyBuckets()
+    const dataIssues: DataIssues = {
+      cardsWithoutCells: 0,
+      cardsWithIncompleteCells: 0,
+    }
 
     const patternContexts = selectedPatterns.map((pattern) => {
       const uniquePatternCells = Array.from(
@@ -294,33 +318,62 @@ export async function POST(request: Request) {
     for (const card of cards) {
       const cardKey = String(card.id)
       const cardCells = cellsByCard.get(cardKey) ?? []
-
-      const fullNumbers = cardCells
-        .map((cell) => cell.number)
-        .filter((num): num is number => typeof num === 'number')
-      const fullMissingNumbers = fullNumbers.filter((num) => !calledSet.has(num)).sort((a, b) => a - b)
-
-      addToBuckets(fullBuckets, {
-        cardCode: card.code,
-        missingCount: fullMissingNumbers.length,
-        missingNumbers: fullMissingNumbers,
-      })
-
-      if (patternContexts.length === 0) continue
-
       const cellMap = new Map<string, CellRow>()
       for (const cell of cardCells) {
         cellMap.set(`${cell.row}:${cell.col}`, cell)
       }
 
+      if (cellMap.size === 0) {
+        dataIssues.cardsWithoutCells += 1
+      }
+      if (cellMap.size < fullBoardTargets.length) {
+        dataIssues.cardsWithIncompleteCells += 1
+      }
+
+      const fullMissingNumbers: number[] = []
+      let fullUnknownMissing = 0
+      for (const target of fullBoardTargets) {
+        const cell = cellMap.get(`${target.row}:${target.col}`)
+        if (!cell) {
+          fullUnknownMissing += 1
+          continue
+        }
+
+        if (cell.number === null) {
+          fullUnknownMissing += 1
+          continue
+        }
+
+        if (!calledSet.has(cell.number)) {
+          fullMissingNumbers.push(cell.number)
+        }
+      }
+
+      addToBuckets(fullBuckets, {
+        cardCode: card.code,
+        missingCount: fullMissingNumbers.length + fullUnknownMissing,
+        missingNumbers: fullMissingNumbers,
+      })
+
+      if (patternContexts.length === 0) continue
+
       for (const context of patternContexts) {
         if (context.cells.length === 0) continue
 
         const missingNumbers: number[] = []
+        let unknownMissing = 0
         for (const target of context.cells) {
           const cell = cellMap.get(`${target.row}:${target.col}`)
-          if (!cell) continue
-          if (cell.number === null) continue
+          if (!cell) {
+            unknownMissing += 1
+            continue
+          }
+          if (cell.number === null) {
+            if (!isCenterCell(target.row, target.col)) {
+              unknownMissing += 1
+            }
+            continue
+          }
           if (!calledSet.has(cell.number)) {
             missingNumbers.push(cell.number)
           }
@@ -328,7 +381,7 @@ export async function POST(request: Request) {
 
         addToBuckets(context.buckets, {
           cardCode: card.code,
-          missingCount: missingNumbers.length,
+          missingCount: missingNumbers.length + unknownMissing,
           missingNumbers: missingNumbers.sort((a, b) => a - b),
         })
       }
@@ -345,6 +398,7 @@ export async function POST(request: Request) {
       calledNumbersCount: calledNumbers.length,
       cardsAnalyzed: cards.length,
       full: sortBuckets(fullBuckets),
+      dataIssues,
       patterns: patternResults,
       pattern: patternResults[0] ?? { selected: null, targetCells: 0, buckets: emptyBuckets() },
     })

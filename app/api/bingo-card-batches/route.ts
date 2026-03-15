@@ -11,20 +11,55 @@ type BatchRow = {
   uploaded_at: string
 }
 
-export async function GET() {
-  try {
-    const supabaseAdmin = getSupabaseAdmin()
+const batchTableCandidates = ['bingo_card_batches', 'bingo_cards_batches'] as const
+
+const isMissingTableError = (message: string, table: string) =>
+  message.includes(table) &&
+  (message.includes('does not exist') ||
+    message.includes('schema cache') ||
+    message.includes('Could not find the table'))
+
+const loadBatchesFromAvailableTable = async () => {
+  const supabaseAdmin = getSupabaseAdmin()
+  let lastErrorMessage = 'No se pudo leer los lotes'
+
+  for (let index = 0; index < batchTableCandidates.length; index++) {
+    const table = batchTableCandidates[index]
     const { data, error } = await supabaseAdmin
-      .from('bingo_card_batches')
+      .from(table)
       .select('id, name, source_filename, total_cards, uploaded_at')
       .order('uploaded_at', { ascending: false })
 
-    if (error) {
+    if (!error) {
+      return {
+        ok: true as const,
+        table,
+        batches: (data ?? []) as BatchRow[],
+      }
+    }
+
+    lastErrorMessage = error.message
+    const canTryNext =
+      index < batchTableCandidates.length - 1 && isMissingTableError(error.message, table)
+    if (canTryNext) continue
+    break
+  }
+
+  return {
+    ok: false as const,
+    error: lastErrorMessage,
+  }
+}
+
+export async function GET() {
+  try {
+    const result = await loadBatchesFromAvailableTable()
+    if (!result.ok) {
       return NextResponse.json(
         {
           ok: false,
-          error: error.message,
-          hint: 'Si la tabla no existe, ejecuta el SQL de setup para lotes.',
+          error: result.error,
+          hint: 'Si la tabla no existe, ejecuta el SQL de setup para lotes (bingo_card_batches).',
         },
         { status: 500 }
       )
@@ -32,7 +67,8 @@ export async function GET() {
 
     return NextResponse.json({
       ok: true,
-      batches: (data ?? []) as BatchRow[],
+      batchTable: result.table,
+      batches: result.batches,
     })
   } catch (error) {
     return NextResponse.json(

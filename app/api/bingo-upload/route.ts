@@ -5,6 +5,60 @@ import { parseBingoCardsFromPdf, type ParsedBingoCard } from '@/app/lib/bingoPdf
 export const runtime = 'nodejs'
 
 type CardId = string | number
+type BatchInsertResult = { id: string | number }
+
+const batchTableCandidates = ['bingo_card_batches', 'bingo_cards_batches'] as const
+
+const isMissingTableError = (message: string, table: string) =>
+  message.includes(table) &&
+  (message.includes('does not exist') ||
+    message.includes('schema cache') ||
+    message.includes('Could not find the table'))
+
+const createBatchRecord = async (params: {
+  name: string
+  sourceFilename: string
+  totalCards: number
+}) => {
+  const supabaseAdmin = getSupabaseAdmin()
+  let lastErrorMessage = 'No se pudo crear el lote'
+
+  for (let index = 0; index < batchTableCandidates.length; index++) {
+    const table = batchTableCandidates[index]
+    const { data, error } = await supabaseAdmin
+      .from(table)
+      .insert({
+        name: params.name,
+        source_filename: params.sourceFilename,
+        total_cards: params.totalCards,
+        uploaded_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single()
+
+    if (!error && data?.id) {
+      return {
+        ok: true as const,
+        table,
+        batch: data as BatchInsertResult,
+      }
+    }
+
+    if (error) {
+      lastErrorMessage = error.message
+      const canTryNext =
+        index < batchTableCandidates.length - 1 && isMissingTableError(error.message, table)
+      if (canTryNext) continue
+    }
+
+    break
+  }
+
+  return {
+    ok: false as const,
+    error: lastErrorMessage,
+  }
+}
 
 const cardToRows = (cardId: CardId, card: ParsedBingoCard) => {
   const columns = [card.b, card.i, card.n, card.g, card.o]
@@ -136,29 +190,24 @@ export async function POST(request: Request) {
         ? requestedBatchName.trim()
         : file.name.replace(/\.pdf$/i, '')
 
-    const { data: batch, error: batchError } = await supabaseAdmin
-      .from('bingo_card_batches')
-      .insert({
-        name: batchName,
-        source_filename: file.name,
-        total_cards: cards.length,
-        uploaded_at: new Date().toISOString(),
-      })
-      .select('id')
-      .single()
+    const batchInsert = await createBatchRecord({
+      name: batchName,
+      sourceFilename: file.name,
+      totalCards: cards.length,
+    })
 
-    if (batchError || !batch?.id) {
+    if (!batchInsert.ok) {
       return NextResponse.json(
         {
           ok: false,
-          error: `Error creando lote: ${batchError?.message ?? 'sin id'}`,
-          hint: 'Verifica que exista la tabla bingo_card_batches.',
+          error: `Error creando lote: ${batchInsert.error}`,
+          hint: 'Verifica que exista la tabla bingo_card_batches o bingo_cards_batches.',
         },
         { status: 500 }
       )
     }
 
-    const batchId = String(batch.id)
+    const batchId = String(batchInsert.batch.id)
     let insertedCards = 0
     let updatedCards = 0
     let insertedCells = 0
@@ -194,6 +243,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       ok: true,
       batchId,
+      batchTable: batchInsert.table,
       batchName,
       sourceFile: file.name,
       parsedCards: parsed.cards.length,
