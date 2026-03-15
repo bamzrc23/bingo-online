@@ -1,0 +1,360 @@
+import { NextResponse } from 'next/server'
+import { getSupabaseAdmin } from '@/app/lib/supabaseAdmin'
+
+export const runtime = 'nodejs'
+
+type PatternCell = {
+  row: number
+  col: number
+}
+
+type PatternRow = {
+  id: string
+  code: string
+  name: string
+  category: 'letter' | 'number'
+  cells: PatternCell[]
+}
+
+type CardRow = {
+  id: string | number
+  code: number
+}
+
+type CellRow = {
+  card_id: string | number
+  row: number
+  col: number
+  number: number | null
+}
+
+type AnalysisItem = {
+  cardCode: number
+  missingCount: number
+  missingNumbers: number[]
+}
+
+type AnalysisBuckets = {
+  winner: AnalysisItem[]
+  missing1: AnalysisItem[]
+  missing2: AnalysisItem[]
+  missing3: AnalysisItem[]
+}
+
+type PatternAnalysisResult = {
+  selected: PatternRow | null
+  targetCells: number
+  buckets: AnalysisBuckets
+}
+
+type RequestBody = {
+  batchId?: string | null
+  patternId?: string | null
+  patternIds?: string[] | null
+}
+
+const chunkArray = <T,>(input: T[], size: number) => {
+  const output: T[][] = []
+  for (let i = 0; i < input.length; i += size) {
+    output.push(input.slice(i, i + size))
+  }
+  return output
+}
+
+const emptyBuckets = (): AnalysisBuckets => ({
+  winner: [],
+  missing1: [],
+  missing2: [],
+  missing3: [],
+})
+
+const addToBuckets = (buckets: AnalysisBuckets, item: AnalysisItem) => {
+  if (item.missingCount === 0) buckets.winner.push(item)
+  if (item.missingCount === 1) buckets.missing1.push(item)
+  if (item.missingCount === 2) buckets.missing2.push(item)
+  if (item.missingCount === 3) buckets.missing3.push(item)
+}
+
+const sortBuckets = (buckets: AnalysisBuckets) => {
+  buckets.winner.sort((a, b) => a.cardCode - b.cardCode)
+  buckets.missing1.sort((a, b) => a.cardCode - b.cardCode)
+  buckets.missing2.sort((a, b) => a.cardCode - b.cardCode)
+  buckets.missing3.sort((a, b) => a.cardCode - b.cardCode)
+  return buckets
+}
+
+const getCardsByCodes = async (codes: number[]) => {
+  const supabaseAdmin = getSupabaseAdmin()
+  const cards: CardRow[] = []
+  for (const chunk of chunkArray(codes, 500)) {
+    const { data, error } = await supabaseAdmin.from('bingo_cards').select('id, code').in('code', chunk)
+
+    if (error) {
+      throw new Error(`Error leyendo cartones: ${error.message}`)
+    }
+
+    cards.push(...((data ?? []) as CardRow[]))
+  }
+  return cards
+}
+
+const getCellsByCardIds = async (cardIds: Array<string | number>) => {
+  const supabaseAdmin = getSupabaseAdmin()
+  const cells: CellRow[] = []
+  for (const chunk of chunkArray(cardIds, 500)) {
+    const { data, error } = await supabaseAdmin
+      .from('bingo_cells')
+      .select('card_id, row, col, number')
+      .in('card_id', chunk)
+
+    if (error) {
+      throw new Error(`Error leyendo celdas: ${error.message}`)
+    }
+
+    cells.push(...((data ?? []) as CellRow[]))
+  }
+  return cells
+}
+
+const isMissingPatternIdError = (message: string) =>
+  message.includes('column') && message.includes('bingo_patterns.id') && message.includes('does not exist')
+
+const getPatternByKey = async (patternKey: string): Promise<PatternRow | null> => {
+  const supabaseAdmin = getSupabaseAdmin()
+
+  const byId = await supabaseAdmin
+    .from('bingo_patterns')
+    .select('id, code, name, category, cells')
+    .eq('id', patternKey)
+    .maybeSingle()
+
+  if (!byId.error && byId.data) {
+    return byId.data as PatternRow
+  }
+
+  if (byId.error && !isMissingPatternIdError(byId.error.message)) {
+    throw new Error(`Error leyendo patron: ${byId.error.message}`)
+  }
+
+  const byCode = await supabaseAdmin
+    .from('bingo_patterns')
+    .select('code, name, category, cells')
+    .eq('code', patternKey)
+    .maybeSingle()
+
+  if (byCode.error) {
+    throw new Error(`Error leyendo patron: ${byCode.error.message}`)
+  }
+
+  if (!byCode.data) return null
+
+  return {
+    ...(byCode.data as Omit<PatternRow, 'id'>),
+    id: String((byCode.data as { code: string }).code),
+  }
+}
+
+const normalizePatternKeys = (body: RequestBody) => {
+  const keys: string[] = []
+  if (typeof body.patternId === 'string' && body.patternId.trim()) {
+    keys.push(body.patternId.trim())
+  }
+  if (Array.isArray(body.patternIds)) {
+    for (const key of body.patternIds) {
+      if (typeof key === 'string' && key.trim()) keys.push(key.trim())
+    }
+  }
+  return Array.from(new Set(keys))
+}
+
+export async function POST(request: Request) {
+  try {
+    const supabaseAdmin = getSupabaseAdmin()
+    const body = (await request.json().catch(() => ({}))) as RequestBody
+
+    const batchId = typeof body.batchId === 'string' && body.batchId.trim() ? body.batchId : null
+    const patternKeys = normalizePatternKeys(body)
+
+    const { data: calledNumbersRows, error: calledError } = await supabaseAdmin
+      .from('called_numbers')
+      .select('number')
+      .order('created_at', { ascending: true })
+
+    if (calledError) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Error leyendo numeros cantados: ${calledError.message}`,
+        },
+        { status: 500 }
+      )
+    }
+
+    const calledNumbers = (calledNumbersRows ?? [])
+      .map((row) => Number((row as { number: number }).number))
+      .filter((num) => Number.isInteger(num) && num >= 1 && num <= 75)
+    const calledSet = new Set<number>(calledNumbers)
+
+    const selectedPatterns: PatternRow[] = []
+    const seenPatternCodes = new Set<string>()
+    for (const key of patternKeys) {
+      const pattern = await getPatternByKey(key)
+      if (!pattern) continue
+      if (seenPatternCodes.has(pattern.code)) continue
+      seenPatternCodes.add(pattern.code)
+      selectedPatterns.push(pattern)
+    }
+
+    let cardCodes: number[] = []
+
+    if (batchId) {
+      const { data: links, error: linksError } = await supabaseAdmin
+        .from('bingo_batch_cards')
+        .select('card_code')
+        .eq('batch_id', batchId)
+
+      if (linksError) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: `Error leyendo lote: ${linksError.message}`,
+          },
+          { status: 500 }
+        )
+      }
+
+      cardCodes = (links ?? [])
+        .map((row) => Number((row as { card_code: number }).card_code))
+        .filter((code) => Number.isInteger(code))
+    } else {
+      const { data: cards, error: cardsError } = await supabaseAdmin.from('bingo_cards').select('code')
+
+      if (cardsError) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: `Error leyendo cartones: ${cardsError.message}`,
+          },
+          { status: 500 }
+        )
+      }
+
+      cardCodes = (cards ?? [])
+        .map((row) => Number((row as { code: number }).code))
+        .filter((code) => Number.isInteger(code))
+    }
+
+    cardCodes = Array.from(new Set(cardCodes)).sort((a, b) => a - b)
+
+    if (cardCodes.length === 0) {
+      const emptyPatternResults: PatternAnalysisResult[] = selectedPatterns.map((pattern) => ({
+        selected: pattern,
+        targetCells: 0,
+        buckets: emptyBuckets(),
+      }))
+
+      return NextResponse.json({
+        ok: true,
+        calledNumbersCount: calledNumbers.length,
+        cardsAnalyzed: 0,
+        full: emptyBuckets(),
+        patterns: emptyPatternResults,
+        pattern: emptyPatternResults[0] ?? { selected: null, targetCells: 0, buckets: emptyBuckets() },
+      })
+    }
+
+    const cards = await getCardsByCodes(cardCodes)
+    const cardIds = cards.map((card) => card.id)
+    const cells = await getCellsByCardIds(cardIds)
+
+    const cellsByCard = new Map<string, CellRow[]>()
+    for (const cell of cells) {
+      const key = String(cell.card_id)
+      const current = cellsByCard.get(key)
+      if (current) current.push(cell)
+      else cellsByCard.set(key, [cell])
+    }
+
+    const fullBuckets = emptyBuckets()
+
+    const patternContexts = selectedPatterns.map((pattern) => {
+      const uniquePatternCells = Array.from(
+        new Map(
+          (Array.isArray(pattern.cells) ? pattern.cells : []).map((cell) => [`${cell.row}:${cell.col}`, cell])
+        ).values()
+      )
+      return {
+        selected: pattern,
+        targetCells: uniquePatternCells.length,
+        cells: uniquePatternCells,
+        buckets: emptyBuckets(),
+      }
+    })
+
+    for (const card of cards) {
+      const cardKey = String(card.id)
+      const cardCells = cellsByCard.get(cardKey) ?? []
+
+      const fullNumbers = cardCells
+        .map((cell) => cell.number)
+        .filter((num): num is number => typeof num === 'number')
+      const fullMissingNumbers = fullNumbers.filter((num) => !calledSet.has(num)).sort((a, b) => a - b)
+
+      addToBuckets(fullBuckets, {
+        cardCode: card.code,
+        missingCount: fullMissingNumbers.length,
+        missingNumbers: fullMissingNumbers,
+      })
+
+      if (patternContexts.length === 0) continue
+
+      const cellMap = new Map<string, CellRow>()
+      for (const cell of cardCells) {
+        cellMap.set(`${cell.row}:${cell.col}`, cell)
+      }
+
+      for (const context of patternContexts) {
+        if (context.cells.length === 0) continue
+
+        const missingNumbers: number[] = []
+        for (const target of context.cells) {
+          const cell = cellMap.get(`${target.row}:${target.col}`)
+          if (!cell) continue
+          if (cell.number === null) continue
+          if (!calledSet.has(cell.number)) {
+            missingNumbers.push(cell.number)
+          }
+        }
+
+        addToBuckets(context.buckets, {
+          cardCode: card.code,
+          missingCount: missingNumbers.length,
+          missingNumbers: missingNumbers.sort((a, b) => a - b),
+        })
+      }
+    }
+
+    const patternResults: PatternAnalysisResult[] = patternContexts.map((context) => ({
+      selected: context.selected,
+      targetCells: context.targetCells,
+      buckets: sortBuckets(context.buckets),
+    }))
+
+    return NextResponse.json({
+      ok: true,
+      calledNumbersCount: calledNumbers.length,
+      cardsAnalyzed: cards.length,
+      full: sortBuckets(fullBuckets),
+      patterns: patternResults,
+      pattern: patternResults[0] ?? { selected: null, targetCells: 0, buckets: emptyBuckets() },
+    })
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Error desconocido',
+      },
+      { status: 500 }
+    )
+  }
+}
