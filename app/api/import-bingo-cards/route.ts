@@ -1,15 +1,11 @@
 // app/api/import-bingo-cards/route.ts
 import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { getSupabaseAdmin } from '@/app/lib/supabaseAdmin'
 import cards from '@/data/bingo_cards_normales_supabase.json'
-
-const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-)
 
 export async function POST() {
   try {
+    const supabaseAdmin = getSupabaseAdmin()
     let insertedCards = 0
     let insertedCells = 0
 
