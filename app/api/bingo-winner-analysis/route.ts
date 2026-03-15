@@ -66,6 +66,11 @@ const chunkArray = <T,>(input: T[], size: number) => {
   return output
 }
 
+const isLikelyTransportError = (message: string) => {
+  const value = message.toLowerCase()
+  return value.includes('fetch failed') || value.includes('network') || value.includes('url')
+}
+
 const emptyBuckets = (): AnalysisBuckets => ({
   winner: [],
   missing1: [],
@@ -117,17 +122,38 @@ const getCardsByCodes = async (codes: number[]) => {
 const getCellsByCardIds = async (cardIds: Array<string | number>) => {
   const supabaseAdmin = getSupabaseAdmin()
   const cells: CellRow[] = []
-  for (const chunk of chunkArray(cardIds, 500)) {
-    const { data, error } = await supabaseAdmin
-      .from('bingo_cells')
-      .select('card_id, row, col, number')
-      .in('card_id', chunk)
+  const readCellsChunk = async (chunk: Array<string | number>): Promise<void> => {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('bingo_cells')
+        .select('card_id, row, col, number')
+        .in('card_id', chunk)
 
-    if (error) {
-      throw new Error(`Error leyendo celdas: ${error.message}`)
+      if (error) {
+        if (chunk.length > 1 && isLikelyTransportError(error.message)) {
+          const middle = Math.ceil(chunk.length / 2)
+          await readCellsChunk(chunk.slice(0, middle))
+          await readCellsChunk(chunk.slice(middle))
+          return
+        }
+        throw new Error(`Error leyendo celdas: ${error.message}`)
+      }
+
+      cells.push(...((data ?? []) as CellRow[]))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Error desconocido'
+      if (chunk.length > 1 && isLikelyTransportError(message)) {
+        const middle = Math.ceil(chunk.length / 2)
+        await readCellsChunk(chunk.slice(0, middle))
+        await readCellsChunk(chunk.slice(middle))
+        return
+      }
+      throw new Error(`Error leyendo celdas: ${message}`)
     }
+  }
 
-    cells.push(...((data ?? []) as CellRow[]))
+  for (const chunk of chunkArray(cardIds, 120)) {
+    await readCellsChunk(chunk)
   }
   return cells
 }
@@ -326,32 +352,44 @@ export async function POST(request: Request) {
       if (cellMap.size === 0) {
         dataIssues.cardsWithoutCells += 1
       }
-      if (cellMap.size < fullBoardTargets.length) {
+      const structuralMissingCells = fullBoardTargets.filter(
+        (target) => !cellMap.has(`${target.row}:${target.col}`)
+      ).length
+      if (structuralMissingCells > 0) {
         dataIssues.cardsWithIncompleteCells += 1
       }
 
       const fullMissingNumbers: number[] = []
-      let fullUnknownMissing = 0
+      const fullNumbers: number[] = []
       for (const target of fullBoardTargets) {
         const cell = cellMap.get(`${target.row}:${target.col}`)
         if (!cell) {
-          fullUnknownMissing += 1
           continue
         }
 
         if (cell.number === null) {
-          fullUnknownMissing += 1
           continue
         }
 
-        if (!calledSet.has(cell.number)) {
-          fullMissingNumbers.push(cell.number)
+        fullNumbers.push(cell.number)
+      }
+
+      for (const numberValue of fullNumbers) {
+        if (!calledSet.has(numberValue)) {
+          fullMissingNumbers.push(numberValue)
         }
+      }
+
+      // Evita falsos ganadores cuando la estructura del carton esta incompleta
+      // o cuando no hay ningun numero jugable guardado.
+      let fullMissingCount = fullMissingNumbers.length + structuralMissingCells
+      if (fullNumbers.length === 0) {
+        fullMissingCount += 1
       }
 
       addToBuckets(fullBuckets, {
         cardCode: card.code,
-        missingCount: fullMissingNumbers.length + fullUnknownMissing,
+        missingCount: fullMissingCount,
         missingNumbers: fullMissingNumbers,
       })
 
